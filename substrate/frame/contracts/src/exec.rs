@@ -412,7 +412,7 @@ pub trait Executable<T: Config>: Sized {
 	fn execute<E: Ext<T = T>>(
 		self,
 		ext: &mut E,
-		function: &ExportedFunction,
+		function: ExportedFunction,
 		input_data: Vec<u8>,
 	) -> ExecResult;
 
@@ -733,6 +733,29 @@ where
 		stack.run(executable, input_data).map(|ret| (account_id, ret))
 	}
 
+	pub fn bench_new_call(
+		dest: T::AccountId,
+		origin: Origin<T>,
+		gas_meter: &'a mut GasMeter<T>,
+		storage_meter: &'a mut storage::meter::Meter<T>,
+		schedule: &'a Schedule<T>,
+		value: BalanceOf<T>,
+		debug_message: Option<&'a mut DebugBufferVec<T>>,
+		determinism: Determinism,
+	) -> (Self, E) {
+		Self::new(
+			FrameArgs::Call { dest, cached_info: None, delegated_call: None },
+			origin,
+			gas_meter,
+			storage_meter,
+			schedule,
+			value,
+			debug_message,
+			determinism,
+		)
+		.unwrap()
+	}
+
 	/// Create a new call stack.
 	fn new(
 		args: FrameArgs<T, E>,
@@ -915,10 +938,10 @@ where
 
 			let call_span = T::Debug::new_call_span(contract_address, entry_point, &input_data);
 
-			let output = T::Debug::intercept_call(contract_address, &entry_point, &input_data)
+			let output = T::Debug::intercept_call(contract_address, entry_point, &input_data)
 				.unwrap_or_else(|| {
 					executable
-						.execute(self, &entry_point, input_data)
+						.execute(self, entry_point, input_data)
 						.map_err(|e| ExecError { error: e.error, origin: ErrorOrigin::Callee })
 				})?;
 
@@ -1707,10 +1730,10 @@ mod tests {
 		fn execute<E: Ext<T = Test>>(
 			self,
 			ext: &mut E,
-			function: &ExportedFunction,
+			function: ExportedFunction,
 			input_data: Vec<u8>,
 		) -> ExecResult {
-			if let &Constructor = function {
+			if let Constructor = function {
 				E::increment_refcount(self.code_hash).unwrap();
 			}
 			// # Safety
@@ -1723,7 +1746,7 @@ mod tests {
 			// `E: Ext`. However, `MockExecutable` can't be generic over `E` as it would
 			// constitute a cycle.
 			let ext = unsafe { mem::transmute(ext) };
-			if function == &self.func_type {
+			if function == self.func_type {
 				(self.func)(MockCtx { ext, input_data }, &self)
 			} else {
 				exec_success()

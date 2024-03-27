@@ -20,6 +20,7 @@
 
 mod code;
 mod sandbox;
+pub mod sandbox2;
 use self::{
 	code::{
 		body::{self, DynInstr::*},
