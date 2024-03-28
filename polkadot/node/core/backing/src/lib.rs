@@ -249,14 +249,36 @@ struct PerCandidateState {
 
 struct ActiveLeafState {
 	prospective_parachains_mode: ProspectiveParachainsMode,
-	/// The candidates seconded at various depths under this active
-	/// leaf with respect to parachain id. A candidate can only be
-	/// seconded when its hypothetical frontier under every active leaf
-	/// has an empty entry in this map.
-	///
-	/// When prospective parachains are disabled, the only depth
-	/// which is allowed is 0.
-	seconded_at_depth: HashMap<ParaId, BTreeMap<usize, CandidateHash>>,
+
+	/// The candidates for each para under this active leaf.
+	/// This must not exceed max_candidate_depth.
+	candidates_seconded: HashMap<ParaId, HashSet<CandidateHash>>,
+}
+
+impl ActiveLeafState {
+	fn new(prospective_parachains_mode: ProspectiveParachainsMode) -> Self {
+		Self {
+			prospective_parachains_mode,
+			candidates_seconded: HashMap::new()
+		}
+	}
+
+	fn add_seconded_candidate(&mut self, para_id: ParaId, candidate_hash: CandidateHash) {
+		let candidates = self.candidates_seconded.get_mut(&para_id).or_insert_with(|| HashSet::new());
+
+		match self.prospective_parachains_mode {
+			ProspectiveParachainsMode::Disabled => {
+				if candidates.is_empty() {
+					candidates.insert(candidate_hash);
+				}
+			},
+			ProspectiveParachainsMode::Enabled {max_candidate_depth, ..} => {
+				if candidates.len() < max_candidate_depth {
+					candidates.insert(candidate_hash);
+				}
+			}
+		}
+	}
 }
 
 /// The state of the subsystem.
@@ -867,14 +889,7 @@ async fn handle_active_leaves_update<Context>(
 
 			state.per_leaf.insert(
 				leaf.hash,
-				ActiveLeafState {
-					prospective_parachains_mode: ProspectiveParachainsMode::Disabled,
-					// This is empty because the only allowed relay-parent and depth
-					// when prospective parachains are disabled is the leaf hash and 0,
-					// respectively. We've just learned about the leaf hash, so we cannot
-					// have any candidates seconded with it as a relay-parent yet.
-					seconded_at_depth: HashMap::new(),
-				},
+				ActiveLeafState::new(ProspectiveParachainsMode::Disabled),
 			);
 
 			(vec![leaf.hash], ProspectiveParachainsMode::Disabled)
@@ -884,10 +899,7 @@ async fn handle_active_leaves_update<Context>(
 				state.implicit_view.known_allowed_relay_parents_under(&leaf.hash, None);
 
 			// At this point, all candidates outside of the implicit view
-			// have been cleaned up. For all which remain, which we've seconded,
-			// we ask the prospective parachains subsystem where they land in the fragment
-			// tree for the given active leaf. This comprises our `seconded_at_depth`.
-
+			// have been cleaned up.
 			let remaining_seconded = state
 				.per_candidate
 				.iter()
@@ -897,6 +909,7 @@ async fn handle_active_leaves_update<Context>(
 			// one-to-one correspondence to remaining_seconded
 			let mut membership_answers = FuturesOrdered::new();
 
+			// Double-check with prospective-parachains that the remaining candidates are still part of a valid tree.
 			for (candidate_hash, para_id) in remaining_seconded {
 				let (tx, rx) = oneshot::channel();
 				membership_answers
@@ -910,8 +923,9 @@ async fn handle_active_leaves_update<Context>(
 				.await;
 			}
 
-			let mut seconded_at_depth = HashMap::new();
-			if let Some(response) = membership_answers.next().await {
+			let mut active_leaf_state = ActiveLeafState::new(prospective_parachains_mode);
+
+			while let Some(response) = membership_answers.next().await {
 				match response {
 					Err(oneshot::Canceled) => {
 						gum::warn!(
@@ -919,18 +933,9 @@ async fn handle_active_leaves_update<Context>(
 							"Prospective parachains subsystem unreachable for membership request",
 						);
 					},
-					Ok((para_id, candidate_hash, membership)) => {
-						// This request gives membership in all fragment trees. We have some
-						// wasted data here, and it can be optimized if it proves
-						// relevant to performance.
-						if let Some((_, depths)) =
-							membership.into_iter().find(|(leaf_hash, _)| leaf_hash == &leaf.hash)
-						{
-							let para_entry: &mut BTreeMap<usize, CandidateHash> =
-								seconded_at_depth.entry(para_id).or_default();
-							for depth in depths {
-								para_entry.insert(depth, candidate_hash);
-							}
+					Ok((para_id, candidate_hash, is_member)) => {
+						if is_member {
+							active_leaf_state.add_seconded_candidate(para_id, candidate_hash);
 						}
 					},
 				}
@@ -938,7 +943,7 @@ async fn handle_active_leaves_update<Context>(
 
 			state.per_leaf.insert(
 				leaf.hash,
-				ActiveLeafState { prospective_parachains_mode, seconded_at_depth },
+				active_leaf_state,
 			);
 
 			let fresh_relay_parent = match fresh_relay_parents {
@@ -1533,14 +1538,7 @@ async fn handle_validated_candidate_command<Context>(
 									Some(d) => d,
 								};
 
-								let seconded_at_depth = leaf_data
-									.seconded_at_depth
-									.entry(candidate.descriptor().para_id)
-									.or_default();
-
-								for depth in depths {
-									seconded_at_depth.insert(depth, candidate_hash);
-								}
+								leaf_data.add_seconded_candidate(candidate.descriptor().para_id, candidate_hash);
 							}
 
 							rp_state.issued_statements.insert(candidate_hash);

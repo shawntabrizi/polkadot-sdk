@@ -1151,8 +1151,8 @@ impl ParentHeadData {
 }
 
 /// Indicates the relay-parents whose fragment tree a candidate
-/// is present in and the depths of that tree the candidate is present in.
-pub type FragmentTreeMembership = Vec<(Hash, Vec<usize>)>;
+/// is present in.
+pub type FragmentTreeMembership = Vec<Hash>;
 
 /// A collection of ancestor candidates of a parachain.
 pub type Ancestors = HashSet<CandidateHash>;
@@ -1192,8 +1192,9 @@ pub enum ProspectiveParachainsMessage {
 		HypotheticalFrontierRequest,
 		oneshot::Sender<Vec<(HypotheticalCandidate, FragmentTreeMembership)>>,
 	),
-	/// Get the membership of the candidate in all fragment trees.
-	GetTreeMembership(ParaId, CandidateHash, oneshot::Sender<FragmentTreeMembership>),
+	/// Get the membership of the candidate in the fragment tree associated to the given relay
+	/// parent.
+	GetTreeMembership(ParaId, CandidateHash, Hash, oneshot::Sender<bool>),
 	/// Get the minimum accepted relay-parent number for each para in the fragment tree
 	/// for the given relay-chain block hash.
 	///

@@ -155,8 +155,12 @@ async fn run_iteration<Context>(
 				) => answer_get_backable_candidates(&view, relay_parent, para, count, ancestors, tx),
 				ProspectiveParachainsMessage::GetHypotheticalFrontier(request, tx) =>
 					answer_hypothetical_frontier_request(&view, request, tx),
-				ProspectiveParachainsMessage::GetTreeMembership(para, candidate, tx) =>
-					answer_tree_membership_request(&view, para, candidate, tx),
+				ProspectiveParachainsMessage::GetTreeMembership(
+					para,
+					candidate,
+					relay_parent,
+					tx,
+				) => answer_tree_membership_request(&view, para, candidate, relay_parent, tx),
 				ProspectiveParachainsMessage::GetMinimumRelayParents(relay_parent, tx) =>
 					answer_minimum_relay_parents_request(&view, relay_parent, tx),
 				ProspectiveParachainsMessage::GetProspectiveValidationData(request, tx) =>
@@ -202,9 +206,8 @@ async fn handle_active_leaves_update<Context>(
 			return Ok(())
 		};
 
-		let mut pending_availability = HashSet::new();
 		let scheduled_paras =
-			fetch_upcoming_paras(&mut *ctx, hash, &mut pending_availability).await?;
+			fetch_upcoming_paras(&mut *ctx, hash).await?;
 
 		let block_info: RelayChainBlockInfo =
 			match fetch_block_info(&mut *ctx, &mut temp_header_cache, hash).await? {
@@ -226,6 +229,8 @@ async fn handle_active_leaves_update<Context>(
 		let ancestry =
 			fetch_ancestry(&mut *ctx, &mut temp_header_cache, hash, allowed_ancestry_len).await?;
 
+		let mut all_pending_availability = HashSet::new();
+		
 		// Find constraints.
 		let mut fragment_trees = HashMap::new();
 		for para in scheduled_paras {
@@ -249,6 +254,8 @@ async fn handle_active_leaves_update<Context>(
 					continue
 				},
 			};
+
+			all_pending_availability.extend(pending_availability);
 
 			let pending_availability = preprocess_candidates_pending_availability(
 				ctx,
@@ -278,8 +285,6 @@ async fn handle_active_leaves_update<Context>(
 							"Scraped invalid candidate pending availability",
 						);
 
-						// Found a backed invalid candidate.
-						candidate_storage.remove_candidate(&candidate_hash);
 						break
 					},
 				}
@@ -457,6 +462,30 @@ async fn handle_introduce_seconded_candidate<Context>(
 				target: LOG_TARGET,
 				para = ?para,
 				"Received seconded candidate had mismatching validation data",
+			);
+
+			let _ = tx.send(false);
+			return
+		},
+		Err(CandidateStorageInsertionError::CandidateWithDuplicateParentHeadHash(hash)) => {
+			gum::info!(
+				target: LOG_TARGET,
+				para = ?para,
+				"The received seconded candidate would result in a fork. We already have another
+				candidate with this parent head hash: {:?}. Dropping the candidate.",
+				hash
+			);
+
+			let _ = tx.send(false);
+			return
+		},
+		Err(CandidateStorageInsertionError::CandidateWithDuplicateOutputHeadHash(hash)) => {
+			gum::info!(
+				target: LOG_TARGET,
+				para = ?para,
+				"The received seconded candidate with output head hash {:?} would result in a
+				candidate cycle. Dropping the candidate.",
+				hash
 			);
 
 			let _ = tx.send(false);
@@ -683,25 +712,26 @@ fn fragment_tree_membership(
 	active_leaves: &HashMap<Hash, RelayBlockViewData>,
 	para: ParaId,
 	candidate: CandidateHash,
-) -> FragmentTreeMembership {
-	let mut membership = Vec::new();
-	for (relay_parent, view_data) in active_leaves {
+	relay_parent: Hash,
+) -> bool {
+	if let Some(view_data) = active_leaves.get(&relay_parent) {
 		if let Some(tree) = view_data.fragment_trees.get(&para) {
-			if let Some(depths) = tree.candidate(&candidate) {
-				membership.push((*relay_parent, depths));
+			if tree.candidate(&candidate).is_some() {
+				return true
 			}
 		}
 	}
-	membership
+	false
 }
 
 fn answer_tree_membership_request(
 	view: &View,
 	para: ParaId,
 	candidate: CandidateHash,
-	tx: oneshot::Sender<FragmentTreeMembership>,
+	relay_parent: Hash,
+	tx: oneshot::Sender<bool>,
 ) {
-	let _ = tx.send(fragment_tree_membership(&view.active_leaves, para, candidate));
+	let _ = tx.send(fragment_tree_membership(&view.active_leaves, para, candidate, relay_parent));
 }
 
 fn answer_minimum_relay_parents_request(
@@ -817,7 +847,6 @@ async fn fetch_backing_state<Context>(
 async fn fetch_upcoming_paras<Context>(
 	ctx: &mut Context,
 	relay_parent: Hash,
-	pending_availability: &mut HashSet<CandidateHash>,
 ) -> JfyiErrorResult<Vec<ParaId>> {
 	let (tx, rx) = oneshot::channel();
 
@@ -834,8 +863,6 @@ async fn fetch_upcoming_paras<Context>(
 	for core in cores {
 		match core {
 			CoreState::Occupied(occupied) => {
-				pending_availability.insert(occupied.candidate_hash);
-
 				if let Some(next_up_on_available) = occupied.next_up_on_available {
 					upcoming.insert(next_up_on_available.para_id);
 				}
